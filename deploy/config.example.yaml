@@ -1,0 +1,54 @@
+# sqshd configuration — walking-skeleton subset of SPEC.md §13.
+#
+# Unknown keys are a startup error (exit 78). Keys from SPEC.md §13 that are not
+# listed here (identity claiming, dedupe store, spool, S3, signatures, scripts)
+# belong to later changes and are rejected until those changes ship.
+
+# Identity. Required. Must equal the `host` value in this host's SNS
+# subscription filter policy. Uniqueness across the fleet is an operator
+# responsibility until name claiming (§6.3) ships.
+host_id: web01
+
+# AWS. region, queue_url, and results_table are required.
+region: eu-central-1
+topic_arn: arn:aws:sns:eu-central-1:123456789012:sqsh-commands   # informational for the daemon
+queue_url: https://sqs.eu-central-1.amazonaws.com/123456789012/sqsh-cmd-web01
+results_table: sqsh-results
+
+# Polling and concurrency.
+wait_time_seconds: 20             # SQS long-poll wait; 1..20. Default 20.
+visibility_timeout: 90s           # must be >= max_command_timeout + 30s. Default 90s.
+max_concurrent_commands: 4        # default 4
+
+# Timeouts.
+default_command_timeout: 30s      # must be <= max_command_timeout. Default 30s.
+max_command_timeout: 60s          # requests above this are rejected invalid_timeout. Default 60s.
+max_clock_skew: 300s              # issued_at further in the future is malformed. Default 300s.
+shutdown_grace: 45s               # drain budget on SIGTERM before killing children. Default 45s.
+
+# Output. Per-stream cap; the tail is kept and the result marked truncated.
+# 1KiB..128KiB, default 32KiB.
+max_output_bytes: 32KiB
+
+# Result records expire this long after being written (DynamoDB TTL). Default 336h (14d).
+result_retention: 336h
+
+# Commands this agent will run. Default: none. A command listed here but not
+# implemented is a startup error; `puppet` is registered but disabled and is
+# always rejected as command_not_allowed in this release.
+allowed_commands: [systemctl]
+
+commands:
+  systemctl:
+    # Verb and unit are checked against separate lists (§11.3). Only the
+    # read-only verbs status, is-active, is-enabled, show are accepted.
+    verbs: [status, is-active, is-enabled, show]
+    # Exact unit names including suffix. Templated units are not supported.
+    units: [nginx.service, sshd.service]
+
+# false = dry-run: log the exact argv and record a succeeded result without
+# spawning anything (§17). Default true.
+execute: true
+
+log_level: info                   # debug | info | warn | error
+metrics_addr: 127.0.0.1:9787      # Prometheus listener; empty disables

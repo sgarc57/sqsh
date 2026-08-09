@@ -11,7 +11,7 @@ hosts.
 
 ## 1. Goals
 
-Provide a lightweight daemon (`sqsd`) and CLI (`sqsctl`) that:
+Provide a lightweight daemon (`sqshd`) and CLI (`sqsh`) that:
 
 - Execute a **fixed, allowlisted** set of operational commands on remote hosts.
 - Require **outbound HTTPS only** — no inbound ports, no bastion, no SSH keys on
@@ -43,7 +43,7 @@ Any feature that requires this is out of scope by definition.
 | Term | Meaning |
 | --- | --- |
 | **Operator** | Human or CI principal with IAM permission to publish commands. |
-| **Agent** | One `sqsd` process on one host. |
+| **Agent** | One `sqshd` process on one host. |
 | **Host ID** | Stable identifier for an agent (`host_id`). Not necessarily the OS hostname. |
 | **Request** | A single command invocation, identified by `request_id`. |
 | **Result** | The terminal outcome record for a request. |
@@ -55,7 +55,7 @@ Any feature that requires this is out of scope by definition.
 
 ```
   ┌──────────┐
-  │  sqsctl  │  (operator workstation / CI)
+  │  sqsh  │  (operator workstation / CI)
   └────┬─────┘
        │ 1. GetItem  sqsh-inventory  (does host exist? is it alive?)
        │ 2. Publish  attrs{host=web01}
@@ -71,7 +71,7 @@ Any feature that requires this is out of scope by definition.
     │            │            │
     │ ReceiveMessage(WaitTimeSeconds=20)
     ▼            ▼            ▼
-  sqsd         sqsd         sqsd
+  sqshd         sqshd         sqshd
  host_id=     host_id=     host_id=
   web01        web02        db01          ← claimed at startup (§6.3)
     │
@@ -83,7 +83,7 @@ Any feature that requires this is out of scope by definition.
     │ 3. spool to disk (fsync), then Claim / Complete
     ▼
   ┌─────────────────────────────┐
-  │  DynamoDB: sqsh-results     │◄─── 4. sqsctl polls GetItem(request_id)
+  │  DynamoDB: sqsh-results     │◄─── 4. sqsh polls GetItem(request_id)
   │            sqsh-inventory   │◄─── heartbeat + name claims
   └──────────────┬──────────────┘
                  │ Glue zero-ETL, 15–30 min (§7.5)
@@ -123,7 +123,7 @@ only ever sees messages addressed to it. `maxReceiveCount` then means what it sh
 | --- | --- |
 | Who may issue commands | IAM policy on `sns:Publish` to the topic |
 | Which host runs a command | SNS filter policy (server-side) + agent re-checks `target.host` |
-| What may be run | Agent-local allowlist in `/etc/sqsd/config.yaml` |
+| What may be run | Agent-local allowlist in `/etc/sqshd/config.yaml` |
 | How long a command stays valid | `expires_at` + clock-skew rejection |
 | Run-once | Local dedupe store + conditional DynamoDB write |
 
@@ -159,8 +159,8 @@ covers the Go source repository only; its CI holds no credentials that can mutat
 
 ```
 cmd/
-  sqsd/                  daemon entrypoint, flag parsing, signal wiring
-  sqsctl/                CLI entrypoint
+  sqshd/                 daemon entrypoint, flag parsing, signal wiring
+  sqsh/                  CLI entrypoint
 
 internal/
   agent/                 receive loop, worker pool, lifecycle, heartbeat
@@ -183,8 +183,8 @@ internal/
   version/               build metadata
 
 deploy/
-  sqsd.service           hardened systemd unit
-  sqsd.sudoers.tmpl      generated from the allowlist (§14.1)
+  sqshd.service          hardened systemd unit
+  sqshd.sudoers.tmpl     generated from the allowlist (§14.1)
   config.example.yaml
 
 packaging/               deb / rpm / container
@@ -204,7 +204,7 @@ would let the two drift into a privilege gap (§18.8).
 
 ### 6.1 Publish
 
-`sqsctl` publishes to a single SNS topic with **raw message delivery enabled** on
+`sqsh` publishes to a single SNS topic with **raw message delivery enabled** on
 every subscription, so the SQS body is the request JSON verbatim.
 
 Required message attributes:
@@ -237,7 +237,7 @@ Resolved by giving each host **two** identifiers:
 | Identifier | Value | Stable? | Used for |
 | --- | --- | --- | --- |
 | `instance_ref` | IMDSv2 instance ID, else `/etc/machine-id` | Yes, for the life of the machine | Queue name `sqsh-cmd-<instance_ref>`, IAM resource conditions, claim ownership |
-| `host_id` | Claimed friendly name, e.g. `web01-2` | Reassignable | SNS filter policy, `sqsctl` arguments, dedupe namespace, result records |
+| `host_id` | Claimed friendly name, e.g. `web01-2` | Reassignable | SNS filter policy, `sqsh` arguments, dedupe namespace, result records |
 
 The queue is named after the machine; the name is just a routing label held in the
 subscription's filter policy. Two consequences, both good:
@@ -255,7 +255,7 @@ On first start the agent claims a name; thereafter it reasserts the one it alrea
 holds.
 
 ```
-/var/lib/sqsd/identity.json   (mode 0600, fsynced)
+/var/lib/sqshd/identity.json   (mode 0600, fsynced)
 {
   "host_id": "web01-2",
   "instance_ref": "i-0abc123def456",
@@ -282,7 +282,7 @@ partitioned for longer than `stale_claim_ttl` loses its name to a takeover but n
 restarts, so it never re-runs step 7. With an unconditional heartbeat it would write its
 own `instance_ref`, `queue_url`, and `claim_generation` back over the new owner's record
 the moment connectivity returned. Inventory would then name the old host while the SNS
-filter policy pointed at the new one, and `sqsctl hosts` would report a healthy `web01`
+filter policy pointed at the new one, and `sqsh hosts` would report a healthy `web01`
 whose commands land on a machine the audit trail does not name — the exact class of
 silent lie §15.2 ranks as the worst outcome in the system.
 
@@ -317,10 +317,10 @@ creeping to a new suffix.
 
 **Stale takeover.** `stale_cutoff = now - stale_claim_ttl` (default 24h) lets a name be
 recovered after decommission. Takeover increments `claim_generation`, logs at `WARN`,
-and increments `sqsd_name_takeovers_total`. The agent is **not** granted
+and increments `sqshd_name_takeovers_total`. The agent is **not** granted
 `sns:Unsubscribe` or `sqs:DeleteQueue`, so it cannot clean up the previous occupant's
 subscription — that would hand a compromised host a fleet-wide DoS primitive. Orphaned
-subscriptions are reaped by `sqsctl release <host_id>` or a scheduled janitor. Until
+subscriptions are reaped by `sqsh release <host_id>` or a scheduled janitor. Until
 then the previous occupant's queue receives copies of the name's traffic.
 
 That is harmless only while the previous occupant is genuinely gone — nothing polls the
@@ -333,7 +333,7 @@ loser noticing does (§9.4), and until it notices, one name has two executors.
 `instance_ref`, so `web01` becomes `web01-2` while the old claim remains for up to
 `stale_claim_ttl`. Mitigations: stale takeover reclaims the base name once expired,
 `--claim-name` forces a specific name (failing loudly if held), and
-`sqsctl hosts --stale` plus `sqsctl release` make the cleanup explicit. Operators who
+`sqsh hosts --stale` plus `sqsh release` make the cleanup explicit. Operators who
 want names to track hardware should shorten `stale_claim_ttl`; those who want names
 never to move should raise it.
 
@@ -352,7 +352,7 @@ Table: sqsh-inventory
 ```
 
 Heartbeat every `heartbeat_interval` (default 60s) refreshes `last_seen`. It is a
-conditional reassertion of the claim, not a blind field update — see §6.3. `sqsctl`
+conditional reassertion of the claim, not a blind field update — see §6.3. `sqsh`
 does a `GetItem` before publishing: absent → exit 5; `last_seen` older than
 `3 × heartbeat_interval` → warn and require `--force`.
 
@@ -360,12 +360,12 @@ does a `GetItem` before publishing: absent → exit 5; `last_seen` older than
 before it is eligible for takeover and the name silently becomes free through
 deletion rather than through the audited takeover path.
 
-`alias` is populated from an instance tag and resolved by `sqsctl`, so operators can
-type `sqsctl reboot web01` against a host whose claimed `host_id` is `web01-2`. An
+`alias` is populated from an instance tag and resolved by `sqsh`, so operators can
+type `sqsh reboot web01` against a host whose claimed `host_id` is `web01-2`. An
 ambiguous alias is an error listing the candidates, never a guess.
 
 `boot_id` is `/proc/sys/kernel/random/boot_id`; a change confirms a reboot actually
-happened, which is how `sqsctl reboot --wait` reports success (§11.2).
+happened, which is how `sqsh reboot --wait` reports success (§11.2).
 
 ### 6.5 Queue and subscription provisioning
 
@@ -432,7 +432,7 @@ others.
 | `signature` | string \| null | no | Reserved. See §7.4. |
 | `signature_alg` | string \| null | no | Reserved. `"ed25519"` when enabled. |
 
-`expires_at` is **required**, not optional. `sqsctl` defaults it to
+`expires_at` is **required**, not optional. `sqsh` defaults it to
 `issued_at + 5m` (`--expires-in` to override). An operator who wants a command to
 survive a long outage must say so explicitly.
 
@@ -463,7 +463,7 @@ Written to DynamoDB, not to a queue.
 
 `status` enum:
 
-| Status | Meaning | `sqsctl` exit |
+| Status | Meaning | `sqsh` exit |
 | --- | --- | --- |
 | `running` | Claimed, in progress. Not terminal. | — (keeps polling) |
 | `succeeded` | Ran, exit code 0. | 0 |
@@ -526,14 +526,14 @@ enforces it.**
   is writable **only** by startup reconciliation (§8.4), and it is keyed on `boot_id`.
 - Every other terminal status is final. A `Complete` that would move a result backwards —
   to `running`, to `accepted`, or from one final status to another — is **dropped, not
-  applied**, and increments `sqsd_result_downgrades_prevented_total`.
+  applied**, and increments `sqshd_result_downgrades_prevented_total`.
 - This is what makes §8.7's "replay is always safe" claim true rather than merely
   plausible. Idempotency by `request_id` alone is not enough when two legitimate terminal
   writes exist; ordering has to be enforced, because the spool cannot guarantee it.
 
 For `shutdown`, `accepted` is final by construction: the agent does not come back, so
 nothing ever runs the transition. Same for a `reboot` on a host that never returns —
-`sqsctl` reports that honestly via §11.2 step 4 rather than inventing an outcome.
+`sqsh` reports that honestly via §11.2 step 4 rather than inventing an outcome.
 
 ### 7.3 Versioning rules
 
@@ -570,7 +570,7 @@ a `Z` suffix and second precision. `signature` is base64 (standard, padded) over
 Ed25519 of this exact byte string.
 
 When `require_signature: true`, the agent loads trusted public keys from
-`/etc/sqsd/trusted_keys.d/*.pub` and rejects unsigned or badly signed requests with
+`/etc/sqshd/trusted_keys.d/*.pub` and rejects unsigned or badly signed requests with
 `bad_signature`. Key distribution and rotation are deliberately deferred.
 
 ### 7.5 Storage backend
@@ -581,7 +581,7 @@ correctness question, not a preference. The workload is:
 - Two point writes per request (`running` claim, then terminal result).
 - One conditional write per request (`attribute_not_exists(request_id)`) as the
   cross-agent duplicate guard.
-- Point reads by exact key, polled at 250 ms–2 s by `sqsctl` while it waits.
+- Point reads by exact key, polled at 250 ms–2 s by `sqsh` while it waits.
 - Per-item expiry (14-day retention).
 - Heartbeat writes at `fleet_size / heartbeat_interval` — 500 hosts at 60 s is
   ~8 writes/s sustained.
@@ -616,7 +616,7 @@ replicating changes every 15–30 minutes with CDC and schema evolution, without
 consuming DynamoDB RCUs or touching table availability. So:
 
 ```
-sqsd ──▶ DynamoDB (control plane, ms latency, conditional writes, TTL)
+sqshd ──▶ DynamoDB (control plane, ms latency, conditional writes, TTL)
               │
               │ Glue zero-ETL, 15–30 min, no RCU cost
               ▼
@@ -642,7 +642,7 @@ conveniences above:
   and the terminal write uses `If-Match: <etag>`. Reads are strongly consistent.
 - Expiry via a lifecycle rule on the prefix (day granularity instead of per-item
   seconds).
-- Inventory at `s3://<bucket>/inventory/<host_id>.json`. `sqsctl hosts` gets freshness
+- Inventory at `s3://<bucket>/inventory/<host_id>.json`. `sqsh hosts` gets freshness
   from `ListObjectsV2`, whose `LastModified` per key makes a heartbeat GET unnecessary;
   only `--verbose` fetches the bodies.
 - Costs: S3 `PUT` at ~$5/million is roughly 4× a 1 KB DynamoDB write, so heartbeats
@@ -754,7 +754,7 @@ Two invariants:
 
 ### 8.3 Dedupe store
 
-`/var/lib/sqsd/dedupe.db` (BoltDB or SQLite — single-writer, crash-safe, no server).
+`/var/lib/sqshd/dedupe.db` (BoltDB or SQLite — single-writer, crash-safe, no server).
 
 ```
 key:   request_id
@@ -767,8 +767,8 @@ value: { first_seen, status, result_digest, attempt }
 - The store is the **authoritative** run-once mechanism; it works with DynamoDB
   unreachable. The conditional DynamoDB write is a secondary guard that catches the
   cross-agent case (two hosts sharing a `host_id`) and should fire an alert.
-- Losing `/var/lib/sqsd` is equivalent to losing run-once. The directory must be on
-  persistent storage, and the systemd unit uses `StateDirectory=sqsd`.
+- Losing `/var/lib/sqshd` is equivalent to losing run-once. The directory must be on
+  persistent storage, and the systemd unit uses `StateDirectory=sqshd`.
 
 ### 8.4 Startup reconciliation
 
@@ -811,7 +811,7 @@ meaningful:
 - Only `AtLeastOnce` commands can legitimately be redelivered.
 - Alarm on `ApproximateNumberOfMessagesVisible > 0` on any DLQ.
 - Retrying an `AtMostOnce` command is an **operator decision**:
-  `sqsctl retry <request_id>` publishes a *new* `request_id`. The agent never does
+  `sqsh retry <request_id>` publishes a *new* `request_id`. The agent never does
   this on its own.
 
 ### 8.7 Degraded mode: result store unavailable
@@ -856,7 +856,7 @@ The bound is `stale_claim_ttl`, not anything the agent does — a partition shor
 `stale_claim_ttl` cannot open the window at all. That gives the knob a floor it did not
 have before: **`stale_claim_ttl` should exceed the longest partition worth surviving.**
 See §21.3, where this now constrains the tuning question. Every skipped claim increments
-`sqsd_claims_skipped_total`.
+`sqshd_claims_skipped_total`.
 
 **Backpressure.** An unbounded spool eventually fills the disk, and silently discarding
 audit records is worse than refusing work. Graduated response on
@@ -867,9 +867,9 @@ audit records is worse than refusing work. Graduated response on
 | < 50% | Normal. |
 | ≥ 50% | `WARN` per accepted command. |
 | ≥ 90% | Reject routine commands with `store_unavailable`. **Always** admit `reboot`, `shutdown`, and `script` — the break-glass set, which is the entire point of degraded mode. |
-| = 100% | Drop the oldest spool entry to admit a new one; `ERROR` plus `sqsd_results_dropped_total`. |
+| = 100% | Drop the oldest spool entry to admit a new one; `ERROR` plus `sqshd_results_dropped_total`. |
 
-Dropping is loud and metered, never silent. `sqsd_results_dropped_total > 0` should page:
+Dropping is loud and metered, never silent. `sqshd_results_dropped_total > 0` should page:
 it means an execution happened that will never appear in the audit trail.
 
 **Startup.** The spool is *opened and enumerated* early (§9.1 step 5) so that a failure to
@@ -882,11 +882,11 @@ Enumerate-early / drain-late is the ordering that matters: draining at step 5 wo
 a reboot's spooled `accepted` *before* step 8 could upgrade it to `succeeded` — the common
 case on every reboot, not an edge case.
 
-**Known gap.** `sqsctl --wait` polls the same store the agent cannot reach, so it cannot
+**Known gap.** `sqsh --wait` polls the same store the agent cannot reach, so it cannot
 distinguish "still running" from "ran, but the result is stuck in a spool." It times out
 at `--wait-timeout` and exits 4 with wording that says exactly that, rather than
 implying the command failed or was cancelled. Operators diagnosing an unreachable host
-should read the journal directly; `sqsd --dump-spool` prints pending results as JSON for
+should read the journal directly; `sqshd --dump-spool` prints pending results as JSON for
 that case.
 
 ---
@@ -896,7 +896,7 @@ that case.
 ### 9.1 Startup
 
 ```
-1. Parse flags, load /etc/sqsd/config.yaml
+1. Parse flags, load /etc/sqshd/config.yaml
 2. Validate config          → exit 78 (EX_CONFIG) on error, no partial start
 3. Resolve instance_ref     → IMDSv2 instance ID, else /etc/machine-id → exit 78
 4. Open dedupe store        → exit on failure; never run without run-once
@@ -976,7 +976,7 @@ On `SIGTERM`/`SIGINT`:
 The systemd unit sets `TimeoutStopSec=60` (> `shutdown_grace` + kill margin) so
 systemd does not `SIGKILL` mid-flush.
 
-`reboot`/`shutdown` invoked by the agent will cause systemd to stop `sqsd` as part of
+`reboot`/`shutdown` invoked by the agent will cause systemd to stop `sqshd` as part of
 the shutdown transaction. Because the `accepted` result and the `DeleteMessage` both
 happen *before* the command is invoked, this is a clean exit, not a lost message.
 
@@ -988,7 +988,7 @@ holds this agent's `host_id`. This agent's own subscription still carries
 design — so it is still receiving and executing a copy of every command addressed to a
 name it no longer owns. It must stop, and stopping is the only lever it has.
 
-1. Log at `ERROR` with the winning `instance_ref`; set `sqsd_name_conflict{phase="runtime"}`.
+1. Log at `ERROR` with the winning `instance_ref`; set `sqshd_name_conflict{phase="runtime"}`.
 2. Stop receiving.
 3. Do **not** `ChangeMessageVisibility(0)` on unstarted messages, as §9.3 step 4 would.
    SNS delivered a copy of each to the new owner's queue as well, so these are duplicates
@@ -1000,7 +1000,7 @@ name it no longer owns. It must stop, and stopping is the only lever it has.
 5. Flush the dedupe store and the spool, then exit 78 — the conflict is permanent until
    an operator intervenes, and restarting would only re-detect it at step 7.
 
-`sqsctl release <host_id>` then reaps the orphaned subscription. Until it runs, the
+`sqsh release <host_id>` then reaps the orphaned subscription. Until it runs, the
 stopped agent's queue accumulates copies that expire unread, exactly as §6.3's
 decommissioned-host case describes.
 
@@ -1024,7 +1024,7 @@ published to it to both:
 The conditional claim of §8.2 bounds the damage to *one* execution, not to the *right*
 execution: whichever agent writes `attribute_not_exists(request_id)` first runs the
 command, so a command issued in this window may execute on either machine.
-`sqsd_rejections_total{reason="duplicate"}` is the signal that it happened, which is why
+`sqshd_rejections_total{reason="duplicate"}` is the signal that it happened, which is why
 §15.2 treats that counter as an audit trigger rather than an impossibility.
 
 Shortening `heartbeat_interval` shortens the window. `stale_claim_ttl` governs whether it
@@ -1080,7 +1080,7 @@ cannot cancel or report on.
 
 ### 11.2 Reboot confirmation
 
-Because no exit code is observable, `sqsctl reboot web01 --wait` confirms out of band:
+Because no exit code is observable, `sqsh reboot web01 --wait` confirms out of band:
 
 1. Read the current `boot_id` from `sqsh-inventory`.
 2. Publish, wait for `status: accepted`.
@@ -1149,7 +1149,7 @@ second request while one is running is rejected `concurrency_limit`.
 
 ### 11.5 `script`
 
-Runs a pre-approved script from `scripts_dir` (default `/usr/lib/sqsd/scripts`).
+Runs a pre-approved script from `scripts_dir` (default `/usr/lib/sqshd/scripts`).
 
 Validation, in order:
 
@@ -1169,7 +1169,7 @@ Validation, in order:
 ```yaml
 commands:
   script:
-    dir: /usr/lib/sqsd/scripts
+    dir: /usr/lib/sqshd/scripts
     scripts:
       rotate_logs.sh:      { semantics: at_least_once, timeout: 120 }
       recover_network.sh:  { semantics: at_most_once,  timeout: 60  }
@@ -1191,7 +1191,7 @@ a protocol concern, not an implementation detail.
 - If either stream overflowed, set `output_truncated: true`.
 - If `output_s3_bucket` is configured, the full streams are uploaded to
   `s3://<bucket>/<host>/<request_id>/{stdout,stderr}` and `output_uri` is set.
-  `sqsctl --full` fetches from there.
+  `sqsh --full` fetches from there.
 - Hard cap per stream on disk/S3: `output_max_bytes` (default 8 MiB). Beyond that the
   process is killed and the result is `failed`,
   `error: "output limit exceeded"` — a runaway command must not fill the disk.
@@ -1201,7 +1201,7 @@ a protocol concern, not an implementation detail.
 
 ## 13. Configuration
 
-`/etc/sqsd/config.yaml`, mode `0640`, owner `root:sqsd`. Unknown keys are a **startup
+`/etc/sqshd/config.yaml`, mode `0640`, owner `root:sqshd`. Unknown keys are a **startup
 error** (typo'd `alowed_commands` must not silently allow nothing).
 
 ```yaml
@@ -1237,7 +1237,7 @@ max_clock_skew: 300s
 shutdown_grace: 45s
 
 # Durability (§8.3, §8.7)
-state_dir: /var/lib/sqsd
+state_dir: /var/lib/sqshd
 dedupe_retention: 336h            # 14d; must exceed SQS MessageRetentionPeriod
 result_spool_max_entries: 10000
 result_spool_max_bytes: 256MiB
@@ -1249,7 +1249,7 @@ output_max_bytes: 8MiB
 
 # Security
 require_signature: false
-trusted_keys_dir: /etc/sqsd/trusted_keys.d
+trusted_keys_dir: /etc/sqshd/trusted_keys.d
 allowed_commands: [reboot, shutdown, systemctl, puppet, script]
 
 commands:
@@ -1257,7 +1257,7 @@ commands:
     verbs: [status, is-active, show, restart, reload]
     units: [nginx.service, sshd.service, docker.service, puppet.service]
   script:
-    dir: /usr/lib/sqsd/scripts
+    dir: /usr/lib/sqshd/scripts
     scripts:
       rotate_logs.sh:     { semantics: at_least_once, timeout: 120 }
       recover_network.sh: { semantics: at_most_once,  timeout: 60 }
@@ -1310,11 +1310,11 @@ Given that, two supported deployments:
 **(A) Root + systemd hardening (recommended).** Simpler, no sudo parsing surface, and
 the hardening directives are a genuine constraint on a *buggy* dispatcher.
 
-**(B) Unprivileged `sqsd` user + narrowly scoped sudo.** Choose this if policy
+**(B) Unprivileged `sqshd` user + narrowly scoped sudo.** Choose this if policy
 requires it. Rules must name exact commands with exact arguments and `NOPASSWD`:
 
 ```
-sqsd ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, \
+sqshd ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, \
                           /usr/bin/systemctl poweroff, \
                           /usr/bin/systemctl restart nginx.service, \
                           /usr/bin/systemctl reload nginx.service, \
@@ -1335,22 +1335,22 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-ExecStart=/usr/local/bin/sqsd --config /etc/sqsd/config.yaml
+ExecStart=/usr/local/bin/sqshd --config /etc/sqshd/config.yaml
 Restart=on-failure
 RestartPreventExitStatus=78
 RestartSec=5s
 TimeoutStopSec=60
 WatchdogSec=120
 
-StateDirectory=sqsd
+StateDirectory=sqshd
 StateDirectoryMode=0700
-ConfigurationDirectory=sqsd
+ConfigurationDirectory=sqshd
 
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=/var/lib/sqsd
+ReadWritePaths=/var/lib/sqshd
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
@@ -1395,10 +1395,10 @@ if that filtering is used; VPC endpoints make this practical.
 }
 ```
 
-`dynamodb:Scan` on inventory is what backs `sqsctl hosts`. Keep it out of any role that
+`dynamodb:Scan` on inventory is what backs `sqsh hosts`. Keep it out of any role that
 does not need fleet enumeration.
 
-`sqsctl release` (§6.3 orphan cleanup) needs `sns:Unsubscribe`, `sqs:DeleteQueue`, and
+`sqsh release` (§6.3 orphan cleanup) needs `sns:Unsubscribe`, `sqs:DeleteQueue`, and
 `dynamodb:DeleteItem` on inventory. Put these in a **separate, more privileged**
 `sqsh-admin` role rather than the day-to-day operator role — they are the fleet-DoS
 actions deliberately withheld from agents, and they should not be one typo away during
@@ -1476,7 +1476,7 @@ Denied to agents, deliberately:
 | --- | --- |
 | `sns:Publish` | A host that can both read and publish commands turns one compromise into fleet-wide RCE. The single most important line in this policy. |
 | `sqs:SendMessage` | Same reason, one hop lower. |
-| `sns:Unsubscribe`, `sqs:DeleteQueue` | Fleet-wide DoS primitive. Orphan cleanup after a name takeover is an operator action (`sqsctl release`) or a janitor's, never an agent's (§6.3). |
+| `sns:Unsubscribe`, `sqs:DeleteQueue` | Fleet-wide DoS primitive. Orphan cleanup after a name takeover is an operator action (`sqsh release`) or a janitor's, never an agent's (§6.3). |
 | `dynamodb:DeleteItem` | Results and claim records are append-and-expire; an agent must not be able to erase its own audit trail. |
 | `dynamodb:Scan`, `Query` on inventory | An agent has no reason to enumerate the fleet. |
 
@@ -1538,54 +1538,54 @@ Prometheus on `metrics_addr` (localhost only by default):
 
 | Metric | Type | Labels |
 | --- | --- | --- |
-| `sqsd_messages_received_total` | counter | — |
-| `sqsd_commands_total` | counter | `command`, `status` |
-| `sqsd_rejections_total` | counter | `reason` |
-| `sqsd_command_duration_seconds` | histogram | `command` |
-| `sqsd_commands_in_flight` | gauge | — |
-| `sqsd_visibility_extensions_total` | counter | `command` |
-| `sqsd_aws_errors_total` | counter | `api` |
-| `sqsd_last_successful_poll_timestamp` | gauge | — |
-| `sqsd_dedupe_hits_total` | counter | — |
-| `sqsd_build_info` | gauge | `version`, `commit`, `host_id`, `instance_ref` |
-| `sqsd_pending_results` | gauge | — |
-| `sqsd_spool_oldest_age_seconds` | gauge | — |
-| `sqsd_spool_bytes` | gauge | — |
-| `sqsd_result_write_failures_total` | counter | `op` |
-| `sqsd_results_dropped_total` | counter | — |
-| `sqsd_result_downgrades_prevented_total` | counter | `from`, `to` |
-| `sqsd_claims_skipped_total` | counter | — |
-| `sqsd_name_takeovers_total` | counter | — |
-| `sqsd_name_conflict` | gauge | `held_by`, `phase` (`startup` \| `runtime`) |
+| `sqshd_messages_received_total` | counter | — |
+| `sqshd_commands_total` | counter | `command`, `status` |
+| `sqshd_rejections_total` | counter | `reason` |
+| `sqshd_command_duration_seconds` | histogram | `command` |
+| `sqshd_commands_in_flight` | gauge | — |
+| `sqshd_visibility_extensions_total` | counter | `command` |
+| `sqshd_aws_errors_total` | counter | `api` |
+| `sqshd_last_successful_poll_timestamp` | gauge | — |
+| `sqshd_dedupe_hits_total` | counter | — |
+| `sqshd_build_info` | gauge | `version`, `commit`, `host_id`, `instance_ref` |
+| `sqshd_pending_results` | gauge | — |
+| `sqshd_spool_oldest_age_seconds` | gauge | — |
+| `sqshd_spool_bytes` | gauge | — |
+| `sqshd_result_write_failures_total` | counter | `op` |
+| `sqshd_results_dropped_total` | counter | — |
+| `sqshd_result_downgrades_prevented_total` | counter | `from`, `to` |
+| `sqshd_claims_skipped_total` | counter | — |
+| `sqshd_name_takeovers_total` | counter | — |
+| `sqshd_name_conflict` | gauge | `held_by`, `phase` (`startup` \| `runtime`) |
 
 Alerts, in rough order of how badly they mean the system is lying to you:
 
 | Condition | Meaning |
 | --- | --- |
-| `sqsd_results_dropped_total > 0` | Page. A command executed and will never appear in the audit trail (§8.7). |
-| `time() - sqsd_last_successful_poll_timestamp > 300` | A host is silently not polling. This is the failure mode that makes the whole system untrustworthy — commands appear accepted and never run. |
-| `sqsd_name_takeovers_total` increased | A name moved between machines. Benign at decommission; with the previous holder still alive it is the §9.4 window, and the commands issued in it should be audited. |
-| `sqsd_name_conflict == 1` | Two machines claim one `host_id`; the loser has exited 78 and is not polling (§6.3, §9.4). Best-effort — see below. |
+| `sqshd_results_dropped_total > 0` | Page. A command executed and will never appear in the audit trail (§8.7). |
+| `time() - sqshd_last_successful_poll_timestamp > 300` | A host is silently not polling. This is the failure mode that makes the whole system untrustworthy — commands appear accepted and never run. |
+| `sqshd_name_takeovers_total` increased | A name moved between machines. Benign at decommission; with the previous holder still alive it is the §9.4 window, and the commands issued in it should be audited. |
+| `sqshd_name_conflict == 1` | Two machines claim one `host_id`; the loser has exited 78 and is not polling (§6.3, §9.4). Best-effort — see below. |
 | DLQ depth `> 0` | Repeated failure on a retryable command, or a poison message. |
-| `sqsd_spool_oldest_age_seconds > 3600` | Degraded mode has persisted for an hour; audit records are accumulating locally. |
-| `sqsd_rejections_total{reason="duplicate"} > 0` | Cross-agent duplicate. Three causes, all worth investigating: the §9.4 takeover window, a restored-from-snapshot host reusing an `instance_ref`, or a bug. |
+| `sqshd_spool_oldest_age_seconds > 3600` | Degraded mode has persisted for an hour; audit records are accumulating locally. |
+| `sqshd_rejections_total{reason="duplicate"} > 0` | Cross-agent duplicate. Three causes, all worth investigating: the §9.4 takeover window, a restored-from-snapshot host reusing an `instance_ref`, or a bug. |
 
-**Do not build the only name-conflict alert on `sqsd_name_conflict`.** It is exported by a
+**Do not build the only name-conflict alert on `sqshd_name_conflict`.** It is exported by a
 process that is on its way out, so a scrape may never see it — and a *startup* conflict
 exits at §9.1 step 7, before the metrics listener starts at step 14, so at that phase the
 gauge is never served at all. It is a hint for the runtime case and nothing more.
 
-The detectors that survive are: the winner's `sqsd_name_takeovers_total`, incremented by a
+The detectors that survive are: the winner's `sqshd_name_takeovers_total`, incremented by a
 process that keeps running; the `ERROR` line in the loser's journal, which is durable
 because it is not a metric; and the loser's *absence* — `up == 0`, or a stalled
-`sqsd_last_successful_poll_timestamp`. A name conflict is fundamentally observed as one
+`sqshd_last_successful_poll_timestamp`. A name conflict is fundamentally observed as one
 host going quiet while another announces it took a name, and the alerting should be shaped
 that way rather than around a gauge the conflicted agent must survive long enough to serve.
 
 The duplicate row is worth stating plainly: **restoring a host from a snapshot clones both
 `instance_ref` and `identity.json`**, producing two agents that agree they are the same
 host and share a dedupe namespace and a queue. Snapshot-based provisioning must clear
-`/var/lib/sqsd/identity.json`; the metric above is the detector when it does not. Unlike
+`/var/lib/sqshd/identity.json`; the metric above is the detector when it does not. Unlike
 the §9.4 window, this one has no self-limiting mechanism — both clones reassert the same
 `instance_ref` successfully forever, so neither ever sees `ErrClaimLost`.
 
@@ -1594,26 +1594,26 @@ the §9.4 window, this one has no self-limiting mechanism — both clones reasse
 ## 16. CLI
 
 ```
-sqsctl reboot   <host>
-sqsctl shutdown <host>
-sqsctl puppet   <host>
-sqsctl systemctl <host> restart sshd
-sqsctl script   <host> recover_network.sh
+sqsh reboot   <host>
+sqsh shutdown <host>
+sqsh puppet   <host>
+sqsh systemctl <host> restart sshd
+sqsh script   <host> recover_network.sh
 
-sqsctl hosts [--stale]             # list inventory with freshness and claim info
-sqsctl status <request_id>         # fetch a stored result
-sqsctl retry  <request_id>         # re-publish as a NEW request_id
-sqsctl release <host_id>           # sqsh-admin only: drop a dead host's claim,
+sqsh hosts [--stale]             # list inventory with freshness and claim info
+sqsh status <request_id>         # fetch a stored result
+sqsh retry  <request_id>         # re-publish as a NEW request_id
+sqsh release <host_id>           # sqsh-admin only: drop a dead host's claim,
                                    #   subscription, and queue (§6.3)
 ```
 
-`sqsctl hosts` shows `host_id`, `alias`, `instance_ref`, `agent_version`, and age of
+`sqsh hosts` shows `host_id`, `alias`, `instance_ref`, `agent_version`, and age of
 `last_seen`; `--stale` filters to entries past `3 × heartbeat_interval`, which is the
 cleanup worklist for `release`. Host arguments accept either a claimed `host_id` or an
 `alias`; an ambiguous alias is an error listing the candidates.
 
-Daemon-side flags relevant to the above: `sqsd --claim-name <name>` forces a specific
-name and fails loudly if it is held, and `sqsd --dump-spool` prints pending results as
+Daemon-side flags relevant to the above: `sqshd --claim-name <name>` forces a specific
+name and fails loudly if it is held, and `sqshd --dump-spool` prints pending results as
 JSON for diagnosing a host that cannot reach the store (§8.7).
 
 Global flags:
@@ -1629,15 +1629,15 @@ Global flags:
 | `--json` | off | Emit the raw result record. |
 | `--full` | off | Fetch untruncated output from S3. |
 
-`sqsctl` polls `GetItem` with backoff (250ms → 2s). On `--wait-timeout` it prints the
-`request_id` and the exact `sqsctl status` command to resume, and exits 4. Timing out
+`sqsh` polls `GetItem` with backoff (250ms → 2s). On `--wait-timeout` it prints the
+`request_id` and the exact `sqsh status` command to resume, and exits 4. Timing out
 is **not** cancellation: nothing in this protocol can recall an in-flight command, and
 the CLI must say so rather than implying the command was stopped.
 
 Exit codes: `0` success · `1` remote command failed · `2` usage error · `3` rejected ·
 `4` timed out waiting · `5` host unknown or stale · `6` local/AWS error.
 
-One consequence of §7.2.1 is operator-visible: `sqsctl status` on a `reboot` returns `0`
+One consequence of §7.2.1 is operator-visible: `sqsh status` on a `reboot` returns `0`
 against the provisional `accepted` record and may return `1` once the host comes back and
 reconciliation resolves it to `failed`. That is the record improving, not flapping —
 statuses only move forward — but `--json` output should be read as "best known so far" for
@@ -1681,7 +1681,7 @@ repository separate from the Go source and release tooling.
 The split is by *lifecycle owner*, not just by directory. Getting this wrong produces a
 specific and nasty failure: if OpenTofu manages a subscription's `filter_policy` while
 the agent re-points it at runtime (§6.5), the next `apply` silently reverts routing. The
-host stays up, keeps heartbeating, passes every `sqsctl hosts` check — and every command
+host stays up, keeps heartbeating, passes every `sqsh hosts` check — and every command
 sent to it vanishes. Nothing in §15.2 catches that, because the agent never sees the
 message it was supposed to receive.
 
@@ -1738,8 +1738,8 @@ reintroduces exactly the drift this section exists to prevent.
 sqsh/                                  ← Go source; no AWS credentials in CI
   cmd/ internal/                       (§5)
   deploy/
-    sqsd.service                       packaged with the binary, versions with it
-    sqsd.sudoers.tmpl                  generated from the allowlist (§14.1)
+    sqshd.service                       packaged with the binary, versions with it
+    sqshd.sudoers.tmpl                  generated from the allowlist (§14.1)
     config.example.yaml
   packaging/                           deb / rpm / container
 
@@ -1895,7 +1895,7 @@ provider versions, and avoid tool-specific functions.
   (§14.1), which is code-repo data — splitting it into the infrastructure repo would let
   the two drift into a privilege gap.
 - **Anything that runs a command.** No `null_resource`/`local-exec` wrappers that publish
-  to the topic. Operations go through `sqsctl`, where they are authorized, expiring,
+  to the topic. Operations go through `sqsh`, where they are authorized, expiring,
   deduped, and audited. An `apply` that reboots hosts is neither.
 
 ---
@@ -1907,12 +1907,12 @@ Additive under the §7.3 rules — no version bump needed.
 | Extension | Sketch |
 | --- | --- |
 | File distribution | Request carries `artifact: {uri, sha256, dest, mode}`. Agent downloads from S3, verifies the digest, stages atomically via temp file + rename, then executes. Never trusts the URI's content without the digest. |
-| Streaming output | Agent appends chunks to `s3://.../<request_id>/stdout` or a per-request DynamoDB item; `sqsctl --follow` tails. Preferred over a status queue: no ordering problems. |
-| Fleet targeting | Publish with `group` / `role` / `env` attributes; subscription filter policies use `$or` across `host` and `group`. Server-side filtering means fleet targeting costs one publish, not N. Requires a fan-out result view in `sqsctl`. |
+| Streaming output | Agent appends chunks to `s3://.../<request_id>/stdout` or a per-request DynamoDB item; `sqsh --follow` tails. Preferred over a status queue: no ordering problems. |
+| Fleet targeting | Publish with `group` / `role` / `env` attributes; subscription filter policies use `$or` across `host` and `group`. Server-side filtering means fleet targeting costs one publish, not N. Requires a fan-out result view in `sqsh`. |
 | Scheduling | `not_before` already exists in the wire format. Long delays need care: SQS retains messages for at most 14 days, so anything longer needs EventBridge Scheduler to publish at the right time rather than a message sitting in a queue. |
 | Richer health | Extend the inventory record already required by §6.4. |
 | Fleet reporting | Query the S3 Tables mirror (§7.5) from Athena: reboot history by host, command failure rates, per-host MTTR, compliance exports. No new agent code — the zero-ETL pipeline already carries it. |
-| Claim janitor | Scheduled Lambda holding the `sqsh-admin` rights, releasing inventory claims whose `instance_ref` no longer resolves to a running instance. Automates the `sqsctl release` worklist for autoscaling fleets. |
+| Claim janitor | Scheduled Lambda holding the `sqsh-admin` rights, releasing inventory claims whose `instance_ref` no longer resolves to a running instance. Automates the `sqsh release` worklist for autoscaling fleets. |
 | Plugin commands | External executables in an approved dir with a manifest declaring name, argument schema, semantics, timeout, and success exit codes. Prefer this over Go plugins, which are a versioning trap. |
 
 ---
@@ -1922,13 +1922,13 @@ Additive under the §7.3 rules — no version bump needed.
 | Decision | Chosen | Rejected | Why |
 | --- | --- | --- | --- |
 | Routing | SNS + per-host queue with filter policy | Shared queue + `ChangeMessageVisibility(0)` on non-match | Spurious receives count toward `maxReceiveCount`, so messages DLQ before the target sees them; unbounded latency; O(N) wakeups. |
-| Results | DynamoDB keyed by `request_id` | Shared response queue | SQS has no selective receive: two concurrent `sqsctl` users consume each other's responses. DynamoDB also gives the audit log, the idempotency claim, and survives a Ctrl-C'd CLI. |
+| Results | DynamoDB keyed by `request_id` | Shared response queue | SQS has no selective receive: two concurrent `sqsh` users consume each other's responses. DynamoDB also gives the audit log, the idempotency claim, and survives a Ctrl-C'd CLI. |
 | Results | DynamoDB | Ephemeral per-invocation response queue | Leaks queues on CLI crash; needs a reaper; no history. |
 | Auth | IAM now, `signature` reserved and unverified | Ed25519 in v1 | Key distribution and rotation are a project of their own. Fixing the canonical signing string (§7.4) keeps the door open at zero protocol cost. |
 | Auth | IAM now | KMS signing | Per-message KMS calls add latency and cost for a threat IAM already covers. |
 | Retry | Per-command `AtMostOnce` / `AtLeastOnce` | "On failure, don't delete the message" | That rule reboot-loops a host: the message is in flight when the box goes down. |
 | Run-once | Local fsynced store, authoritative | DynamoDB conditional write alone | Must hold with DynamoDB unreachable. DynamoDB is kept as the cross-agent duplicate detector. |
-| Host identity | Claim-with-suffix against inventory, persisted in `identity.json` | Instance ID as the operator-facing name | `sqsctl reboot i-0abc123def456` is hostile during an incident. |
+| Host identity | Claim-with-suffix against inventory, persisted in `identity.json` | Instance ID as the operator-facing name | `sqsh reboot i-0abc123def456` is hostile during an incident. |
 | Host identity | Split `instance_ref` (queue, IAM) from `host_id` (routing, operator) | One identifier for both | A runtime-claimed name cannot anchor an IAM resource condition, and reusing a name would otherwise let a stale command reach replacement hardware. The split makes both problems disappear (§6.2). |
 | Name conflict | Loser exits 78 | Silently re-claim a new suffix | `host_id` is the dedupe namespace and the routing label; renaming a running agent orphans its in-flight requests and splits its run-once history. |
 | Result lifecycle | `accepted` is provisional; status is monotonic and `Complete` enforces it (§7.2.1) | `accepted` is simply terminal, or blind last-write-wins | Terminal commands legitimately produce two terminal writes — `accepted` before the reboot, `succeeded` after it. Declaring `accepted` final loses reboot confirmation from the audit trail; blind overwrite lets a spool replay downgrade a confirmed reboot back to "dispatched" (§8.7). |
@@ -1947,6 +1947,7 @@ Additive under the §7.3 rules — no version bump needed.
 | State locking | S3 `use_lockfile` | DynamoDB lock table | Deprecated in Terraform from 1.11; one fewer resource and a smaller IAM surface (§18.5). |
 | IaC tool | OpenTofu | Terraform | Native state encryption. `sqsh` state is a full fleet topology, and `encrypt = true` leaves it plaintext in plan files and CI artifacts. HCL stays compatible with both. |
 | Script paths | `os.Root` + `fstat` on the handle | `filepath.Join` + `HasPrefix` | Prefix checks lose to symlinks and to TOCTOU between check and open. |
+| Naming | `sqshd` / `sqsh`, `sqsh-` for AWS resources | Keeping `sqsd`/`sqsctl`; renaming the project | Binaries now match the project and the repo. The Sybase `sqsh` collision is accepted rather than solved — see §21.1. |
 | Privilege | Root + systemd hardening | Unprivileged + wildcard sudo | Wildcard sudo rules are routinely bypassable and imply containment that does not exist. Narrow generated sudoers is offered as variant (B). |
 
 ---
@@ -1958,13 +1959,21 @@ behaviour (§8.7, execute and spool), storage backend (§7.5, DynamoDB control p
 an S3 Tables mirror). Resolved in draft 4: provisioning (§18, separate OpenTofu
 repository with explicit resource-ownership tiers). Resolved in draft 5: claim
 reassertion (§6.3, §9.4, conditional heartbeat with `ErrClaimLost` fatal), which closes
-the partition half of question 3 below; and result-status monotonicity (§7.2.1,
-`accepted` is provisional and `Complete` refuses backward writes).
+the partition half of question 3 below; result-status monotonicity (§7.2.1,
+`accepted` is provisional and `Complete` refuses backward writes); and naming
+(question 1, `sqshd`/`sqsh`).
 
-1. **Naming.** `sqsh` collides with the long-standing Sybase/SQL `sqsh` shell, which
-   will confuse package search and web results. Binaries are also currently
-   inconsistent (`sqsd`/`sqsctl` vs. repo `sqsh`). Rename the binaries to
-   `sqshd`/`sqsh`, or rename the project?
+1. ~~**Naming.**~~ **Resolved in draft 5:** binaries are `sqshd` (daemon) and `sqsh`
+   (CLI), consistent with the project and the repository. Config lives at
+   `/etc/sqshd/`, state at `/var/lib/sqshd/`, and metrics are prefixed `sqshd_`.
+   AWS resource names keep the `sqsh-` project prefix (`sqsh-cmd-<instance_ref>`,
+   `sqsh-results`, `sqsh-inventory`) — those name the system, not the binary.
+
+   The collision with the Sybase/SQL `sqsh` shell is **accepted, not solved.** It will
+   confuse package search and web results, and the CLI name is now exactly the colliding
+   token. Renaming the project was considered and rejected as more churn than the
+   confusion is worth for an internal tool; if `sqsh` is ever published to a public
+   package index, revisit it there rather than reopening it here.
 2. **Per-host serialization.** `max_concurrent_commands: 4` permits a `puppet` run and
    a `systemctl restart puppet.service` to overlap. Is a global mutex for all
    `AtMostOnce` commands acceptable (simple, and matches how a human would operate),
@@ -1993,7 +2002,7 @@ the partition half of question 3 below; and result-status monotonicity (§7.2.1,
    implementation, but two backends means two conformance matrices forever. Worth it
    only if avoiding DynamoDB is a real constraint rather than a preference.
 6. **Multi-account / multi-region.** One topic per region, or a global topic with
-   cross-region subscriptions? Affects whether `sqsctl` needs a region flag, and whether
+   cross-region subscriptions? Affects whether `sqsh` needs a region flag, and whether
    name claims are region-scoped or global — a fleet-wide `host_id` namespace across
    regions needs one inventory table, which conflicts with regional isolation.
 7. **`expires_at` default of 5 minutes** is tuned for interactive use and will surprise
