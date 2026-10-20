@@ -5,7 +5,7 @@ Run allowlisted commands on hosts through SNS → SQS, with results recorded in 
 from its own queue, validates it, runs it without a shell, and records the outcome.
 
 `SPEC.md` is the full design. **This build is the walking skeleton**
-(`openspec/changes/add-walking-skeleton`): the thinnest end-to-end slice that proves a
+(`openspec/changes/archive/2026-10-20-add-walking-skeleton`): the thinnest end-to-end slice that proves a
 command reaches exactly the right host and its result comes back.
 
 ## What works in this release
@@ -155,3 +155,62 @@ shared topic while other hosts are subscribed, and keeps the results table unles
 Node dependencies, beyond SSH itself: systemd with `sshd.service` active, passwordless `sudo`
 for the login user (needed to install the unit), and AWS credentials for that user under its
 home directory.
+
+## Examples against the remote node
+
+These were run against the test node. Replace `<host-id>` with your `HOST_ID`. The CLI
+needs the same environment as the e2e check, and the topic ARN is the one `make provision`
+created:
+
+```sh
+export AWS_REGION=eu-central-1
+export SQSH_TOPIC_ARN=<topic-arn>          # aws sns list-topics, the sqsh-commands topic
+export SQSH_RESULTS_TABLE=sqsh-results
+```
+
+**SSH service status.** Waits for the result and prints it:
+
+```sh
+sqsh systemctl <host-id> status sshd.service
+```
+
+Prints `status: succeeded (exit 0)`, then the `systemctl status` output on stdout. Exit `0`.
+
+**Is sshd active, and is it enabled?**
+
+```sh
+sqsh systemctl <host-id> is-active sshd.service    # prints: active, exit 0
+sqsh systemctl <host-id> is-enabled sshd.service   # prints: alias, exit 0 (sshd.service is an alias for ssh.service on Debian)
+```
+
+**Full unit properties** (long output, so use `--json` to keep it structured):
+
+```sh
+sqsh --json systemctl <host-id> show sshd.service
+```
+
+**Publish without waiting, then read the result later:**
+
+```sh
+id=$(sqsh --no-wait systemctl <host-id> is-active sshd.service)
+sqsh status "$id"            # human-readable
+sqsh --json status "$id"     # the stored record as JSON
+```
+
+**Requests the agent rejects.** These are recorded, not dropped, and exit `3`:
+
+```sh
+sqsh systemctl <host-id> restart sshd.service   # rejected: arg_not_allowed, verb "restart" is not allowed
+sqsh systemctl <host-id> status nginx.service   # rejected: arg_not_allowed, unit "nginx.service" is not allowed
+```
+
+**A host with no subscription.** The CLI gives up waiting after `--wait-timeout` and exits
+`4`. It does not cancel anything, and no record appears:
+
+```sh
+sqsh --wait-timeout 30s systemctl web99 status sshd.service
+```
+
+**Not supported: a public address.** The only commands this slice runs are read-only
+`systemctl` queries on `sshd.service`. No command returns the node's public address. Adding one
+means a new command in the allowlist, which is a design change, not a configuration change.
