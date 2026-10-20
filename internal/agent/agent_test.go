@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -435,7 +436,9 @@ func TestLogsCarryRequestIDAndNoOutputAtInfo(t *testing.T) {
 			t.Fatalf("log line is not JSON: %q", line)
 		}
 		msg := rec["msg"].(string)
-		if strings.HasPrefix(msg, "receive loop") || strings.HasPrefix(msg, "shutting down") || strings.HasPrefix(msg, "drained") {
+		// Receive-level lines come before the message is parsed, so they have no request_id.
+		if strings.HasPrefix(msg, "receive loop") || strings.HasPrefix(msg, "shutting down") ||
+			strings.HasPrefix(msg, "drained") || msg == "message received" {
 			continue
 		}
 		if rec["request_id"] != id {
@@ -503,6 +506,64 @@ func TestUnstartedMessageReturnedOnShutdown(t *testing.T) {
 	// And it is immediately receivable again.
 	if again, _ := h.queue.Receive(context.Background(), 1, 0, time.Minute); len(again) != 1 {
 		t.Fatal("returned message is not visible")
+	}
+}
+
+// blockedReceiveQueue holds its first receive until released, then returns the
+// messages the underlying queue hands out. It records whether the context the
+// agent gave the poll was already cancelled when the poll returned.
+type blockedReceiveQueue struct {
+	*awsxfake.Queue
+	started      chan struct{}
+	release      chan struct{}
+	once         sync.Once
+	ctxCancelled atomic.Bool
+}
+
+func (q *blockedReceiveQueue) Receive(ctx context.Context, n int, _, vis time.Duration) ([]awsx.Message, error) {
+	blocked := false
+	q.once.Do(func() { blocked = true; close(q.started) })
+	if blocked {
+		<-q.release
+		q.ctxCancelled.Store(ctx.Err() != nil)
+	}
+	return q.Queue.Receive(context.Background(), n, 0, vis)
+}
+
+// A poll in flight when shutdown begins must not be cancelled: a cancelled
+// ReceiveMessage can drop messages SQS has already returned, leaving them invisible
+// for the full visibility timeout. The message must come back to the queue, not run.
+func TestPollInFlightAtShutdownIsNotCancelledAndMessageIsReturned(t *testing.T) {
+	h := newHarness(t)
+	id, body := request(t, nil)
+	h.queue.Send(body)
+	q := &blockedReceiveQueue{Queue: h.queue, started: make(chan struct{}), release: make(chan struct{})}
+	h.agent.queue = q
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = h.agent.Run(ctx); close(done) }()
+
+	<-q.started
+	cancel()         // shutdown begins while the poll is in flight
+	close(q.release) // the poll now returns the message
+	<-done
+
+	if q.ctxCancelled.Load() {
+		t.Fatal("shutdown cancelled a receive in flight; messages it returned would be lost")
+	}
+	if h.executions() != 0 {
+		t.Fatal("a message received after shutdown began must not be executed")
+	}
+	if _, err := h.store.Get(context.Background(), id); !errors.Is(err, results.ErrNotFound) {
+		t.Fatal("a message received after shutdown began must not be claimed")
+	}
+	_, _, vis := h.queue.Snapshot()
+	if len(vis) != 1 || vis[0] != 0 {
+		t.Fatalf("expected ChangeMessageVisibility(0) for the returned message, got %v", vis)
+	}
+	if again, _ := h.queue.Receive(context.Background(), 1, 0, time.Minute); len(again) != 1 {
+		t.Fatal("returned message is not receivable again")
 	}
 }
 

@@ -27,6 +27,11 @@ const awsCallTimeout = 15 * time.Second
 // running command may keep its message invisible (§8.5).
 const visibilityHeadroom = 60 * time.Second
 
+// receiveSlack is added to the wait time to bound one poll. The poll is not
+// cancelled by shutdown, since a cancelled ReceiveMessage can drop messages SQS
+// has already returned (fix-receive-loss, design D1).
+const receiveSlack = 10 * time.Second
+
 // Agent consumes one queue and executes the commands addressed to it.
 type Agent struct {
 	cfg      *config.Config
@@ -89,13 +94,19 @@ func (a *Agent) Run(ctx context.Context) error {
 		if n == 0 {
 			break // ctx cancelled while waiting for a slot
 		}
-		msgs, err := a.queue.Receive(ctx, n,
-			time.Duration(a.cfg.WaitTimeSeconds)*time.Second, a.cfg.VisibilityTimeout.D())
+		wait := time.Duration(a.cfg.WaitTimeSeconds) * time.Second
+		pollCtx, cancelPoll := context.WithTimeout(context.Background(), wait+receiveSlack)
+		msgs, err := a.queue.Receive(pollCtx, n, wait, a.cfg.VisibilityTimeout.D())
+		cancelPoll()
+		if ctx.Err() != nil {
+			// Shutdown began while the poll was in flight. Nothing here has started, so
+			// hand any messages straight back rather than leave them invisible.
+			a.returnUnstarted(msgs)
+			a.release(n)
+			break
+		}
 		if err != nil {
 			a.release(n)
-			if ctx.Err() != nil {
-				break
-			}
 			a.metrics.AWSErrors.WithLabelValues("ReceiveMessage").Inc()
 			delay := a.Backoff.Next()
 			a.log.Warn("receive failed; backing off", "err", err, "retry_in", delay.String())
@@ -107,6 +118,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		a.Backoff.Reset()
 		a.metrics.LastSuccessfulPoll.SetToCurrentTime()
+		for _, m := range msgs {
+			a.log.Info("message received", "message_id", m.ID, "receive_count", m.ReceiveCount)
+		}
 
 		// Each received message takes one reserved slot; unused reservations
 		// are returned. SQS never returns more than requested, but if it did
@@ -157,6 +171,23 @@ func (a *Agent) reserve(ctx context.Context) int {
 func (a *Agent) release(n int) {
 	for range n {
 		<-a.slots
+	}
+}
+
+// returnUnstarted gives messages back to the queue without starting them, so that
+// they are receivable at once rather than after the visibility timeout.
+func (a *Agent) returnUnstarted(msgs []awsx.Message) {
+	for _, m := range msgs {
+		ctx, cancel := awsCtx()
+		err := a.queue.ChangeVisibility(ctx, m.ReceiptHandle, 0)
+		cancel()
+		if err != nil {
+			a.metrics.AWSErrors.WithLabelValues("ChangeMessageVisibility").Inc()
+			a.log.Warn("could not return unstarted message to the queue", "message_id", m.ID, "err", err)
+			continue
+		}
+		a.log.Info("shutting down; returned unstarted message to the queue", "message_id", m.ID,
+			"receive_count", m.ReceiveCount)
 	}
 }
 

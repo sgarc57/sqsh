@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go/logging"
 
 	"sqsh/internal/agent"
 	"sqsh/internal/awsx"
@@ -31,6 +32,14 @@ import (
 )
 
 func main() { os.Exit(run()) }
+
+// sdkRetryLogger writes the AWS SDK's retry messages into the daemon's log. With
+// aws.LogRetries set, the SDK logs only retries, so every entry here is one.
+type sdkRetryLogger struct{ log *slog.Logger }
+
+func (l sdkRetryLogger) Logf(_ logging.Classification, format string, v ...any) {
+	l.log.Warn("aws sdk retry", "detail", fmt.Sprintf(format, v...))
+}
 
 func run() int {
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -71,7 +80,10 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
+	// Log SDK retries. A ReceiveMessage the SDK retries after its first response was
+	// lost can hide a delivered message from the agent without any error reaching it.
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region),
+		awsconfig.WithLogger(sdkRetryLogger{log: log}), awsconfig.WithClientLogMode(aws.LogRetries))
 	if err != nil {
 		log.Error("cannot load AWS configuration", "err", err)
 		return config.ExitConfig
