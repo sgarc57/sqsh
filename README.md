@@ -170,20 +170,20 @@ export SQSH_TOPIC_ARN=<topic-arn>          # aws sns list-topics, the sqsh-comma
 export SQSH_RESULTS_TABLE=sqsh-results
 ```
 
-**SSH service status.** Waits for the result and prints it:
-
-```sh
-sqsh systemctl <host-id> status sshd.service
-```
-
-Prints `status: succeeded (exit 0)`, then the `systemctl status` output on stdout. Exit `0`.
-
-**Is sshd active, and is it enabled?**
+**Is sshd up?** Waits for the result and prints it. Exit `0` means the service is active:
 
 ```sh
 sqsh systemctl <host-id> is-active sshd.service    # prints: active, exit 0
+```
+
+**Is sshd enabled at boot?**
+
+```sh
 sqsh systemctl <host-id> is-enabled sshd.service   # prints: alias, exit 0 (sshd.service is an alias for ssh.service on Debian)
 ```
+
+The `status` verb is also allowed, but its output includes recent journal lines, which can
+contain login source addresses. Use it only when you need that output.
 
 **Full unit properties** (long output, so use `--json` to keep it structured):
 
