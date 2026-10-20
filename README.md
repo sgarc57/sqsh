@@ -158,11 +158,13 @@ home directory.
 
 ## Examples against the remote node
 
-These were run against the test node. Replace `<host-id>` with your `HOST_ID`. The CLI
-needs the same environment as the e2e check, and the topic ARN is the one `make provision`
-created:
+These were run against the test node. Replace `<host-id>` with your `HOST_ID`. Build the
+CLI and put it on the PATH first, then set the environment the e2e check uses. The topic ARN
+is the one `make provision` created:
 
 ```sh
+make build
+export PATH="$PWD/bin:$PATH"
 export AWS_REGION=eu-central-1
 export SQSH_TOPIC_ARN=<topic-arn>          # aws sns list-topics, the sqsh-commands topic
 export SQSH_RESULTS_TABLE=sqsh-results
