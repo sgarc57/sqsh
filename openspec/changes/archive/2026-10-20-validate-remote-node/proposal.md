@@ -61,7 +61,7 @@ verification record (`verification.md`) is written with the placeholders, not th
 - **SQS** (with its DLQ) is the transport the agent receives commands from. It is required.
 - **SNS** is the fan-out point that routes each command to one host by filter policy. It is
   required, because proving that routing is the premise of the walking skeleton
-  (`add-walking-skeleton/proposal.md`).
+  (`archive/2026-10-20-add-walking-skeleton/proposal.md`).
 - **DynamoDB** holds results and the claim record. It is required.
 - **S3 is not used.** In SPEC it appears only for output offload (§12, deferred) and for
   analytics via S3 Tables (§3). Neither is in this slice.

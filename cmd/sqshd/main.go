@@ -1,6 +1,6 @@
 // Command sqshd is the sqsh agent daemon. See SPEC.md for the full design;
 // this build implements the walking-skeleton subset described in
-// openspec/changes/add-walking-skeleton.
+// openspec/changes/archive/2026-10-20-add-walking-skeleton.
 package main
 
 import (
