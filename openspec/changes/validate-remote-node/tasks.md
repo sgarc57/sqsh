@@ -4,7 +4,7 @@
 - [x] 0.2 Write `deploy/remote/node.env.example` with the variable names `HOST_ID`, `NODE_SSH`, `NODE_PORT`, `NODE_KEY`, `NODE_USER`, and `NODE_HOME`, set to placeholder values
 - [x] 0.3 Make the Makefile include `deploy/remote/node.env` when present, and fail with a pointer to the example file when a remote target runs without it
 - [x] 0.4 Make the deploy and e2e scripts read the node values from the environment only; no script contains a literal node address, port, key path, or user (checked: `git grep` and the untracked-file scan are clean)
-- [ ] 0.5 Before the first commit of this change, run `git grep` for the real values (kept by the operator, not in the repo) across the working tree and staged files; expect no matches. The working tree scan is clean as of the remote-node runs; repeat it on the commit that includes the scripts
+- [x] 0.5 Before the first commit of this change, run `git grep` for the real values (kept by the operator, not in the repo) across the working tree, staged files, and history; expect no matches. Done: clean on the tree at `0a17163` and across all history.
 
 ## 1. Provisioning
 
@@ -49,12 +49,12 @@ Implemented in `deploy/remote/e2e.sh`. Run 4 passed every check. Runs 1–3 are 
 
 - [x] 5.1 Write `openspec/changes/validate-remote-node/verification.md` with: date, region, target as `<host-id>`, the account as `<account-id>`, the node as `<node-ssh>` (with the port and user as placeholders), `uname -m` output, the binary's commit, each request ID with command, stored status, and exit code, and the pass/fail of each check in section 4. Do not write real access values into it
 - [x] 5.2 Record the dependency check results from proposal "Dependencies on the node" (sudo, sshd active, AWS identity) as observed at the time of the run
-- [ ] 5.3 Run `make teardown CONFIRM=yes` only if the operator asks; otherwise leave the resources and unit state as the record states
+- [x] 5.3 Teardown: not requested by the operator, so the resources and unit are kept as the record states. The confirmation guard was tested. Run `make teardown CONFIRM=yes` when wanted
 
 ## 6. Documentation
 
-- [ ] 6.1 Add a "Remote node test" section to `README.md` listing the Makefile targets in order, a one-line description of each, the node dependencies from the proposal, and a link to `verification.md`. Use placeholders only and point to `node.env.example`
-- [ ] 6.2 Leave the "What is NOT implemented yet" table as is; only note that this slice has been exercised on one real node
+- [x] 6.1 Add a "Remote node test" section to `README.md` with the Makefile targets in order, a one-line description of each, the node dependencies, and a link to `verification.md`. Use placeholders only and point to `node.env.example`
+- [x] 6.2 Leave the "What is NOT implemented yet" table as is. The remote-node section notes that this slice has been exercised on one real node
 
 ## 7. Hand-off
 

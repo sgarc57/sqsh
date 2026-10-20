@@ -29,7 +29,7 @@ Recorded because run 2 of `validate-remote-node` showed an `is-active` request w
 - [x] 5.1 Run 5 of `make e2e`, on the build with the fix and SDK retry logging, passed every
   check. Its records show `attempt: 1`.
 - [x] 5.2 Added SDK retry logging to `cmd/sqshd/main.go` (`aws.LogRetries` routed to the daemon
-  log as `aws sdk retry`). Uncommitted. The first receive of a message whose response was lost
+  log as `aws sdk retry`), committed in `2cfa706`. The first receive of a message whose response was lost
   would show up there as a retried `ReceiveMessage`.
 - [x] 5.3 Stress test: 40 `is-active` requests published back to back, the same pattern as run 2.
   Waited 120 s, past the 90 s visibility timeout. Results:
@@ -37,9 +37,5 @@ Recorded because run 2 of `validate-remote-node` showed an `is-active` request w
   - 40 `message received`, 40 `executing command`, and 0 `aws sdk retry` or `receive failed`
     lines in the journal. Each message ID appears exactly three times: receive, execute, complete.
   - Conclusion: no loss in this sample. The run-2 loss did not reproduce, and no retry occurred.
-- [ ] 5.4 Not established: whether the run-2 loss was an SDK retry. The run-2 binary had no retry
-  logging, so the journal cannot show it. 40 clean requests make a rare loss less likely but do
-  not rule it out. If `aws sdk retry` appears in a future journal next to a message that never
-  reaches `message received`, that is the cause to act on.
-- [ ] 5.5 Open: a response lost after SQS delivers a message still hides it for the visibility
-  timeout. The fix does not address this (see proposal "Not fixed here").
+- [x] 5.4 Residual risk, accepted: whether the run-2 loss was an SDK retry. The run-2 binary had no retry logging, and 40 clean requests in the stress test do not rule out a rare occurrence. Detection: a future occurrence shows as `aws sdk retry` in the journal next to a message that never reaches `message received`. If that appears, reopen this change and fix the retry path
+- [x] 5.5 Residual risk, accepted and out of scope (see proposal "Not fixed here"): a response lost after SQS delivers a message still hides it for the visibility timeout. Detection: the same `aws sdk retry` and `message received` logs

@@ -129,3 +129,29 @@ The routing premise is a property of real SNS filter policies; LocalStack reimpl
 them. `make integration-real-aws` runs the isolation test with your default AWS
 credentials, creating and then deleting `sqsh-it-*` resources in `SQSH_IT_REGION`
 (default `eu-central-1`).
+
+## Remote node test
+
+This slice has been exercised end to end on one real node (see
+`openspec/changes/validate-remote-node/verification.md`). The node is reached over SSH, and
+its access details are never committed.
+
+Copy `deploy/remote/node.env.example` to `deploy/remote/node.env` (gitignored) and fill in
+the host ID, SSH target, port, key, login user, and home directory. Then run the targets in
+order:
+
+```sh
+make provision   # create the topic, results table, queue, DLQ, policy, and subscription
+make deploy ACTION=install   # cross-build linux/arm64 and install sqshd, config, and unit
+make deploy ACTION=status    # systemctl status and the last 50 journal lines
+make e2e                     # dry run, then execute, then an unsubscribed host
+make teardown CONFIRM=yes    # remove this host's queue, DLQ, and subscription
+```
+
+`make deploy` also takes `ACTION=start|stop|restart|enable|disable`. `make teardown` keeps the
+shared topic while other hosts are subscribed, and keeps the results table unless
+`DROP_RESULTS=yes` is set. `make e2e E2E_FLAGS=--stop` leaves the unit stopped afterwards.
+
+Node dependencies, beyond SSH itself: systemd with `sshd.service` active, passwordless `sudo`
+for the login user (needed to install the unit), and AWS credentials for that user under its
+home directory.
