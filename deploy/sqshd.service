@@ -1,0 +1,22 @@
+# systemd unit for sqshd on the remote node. Rendered by deploy/remote/lib.sh.
+# Minimal on purpose: no hardening, no dedicated account (SPEC §14.2 is deferred).
+# It runs as the login user so the daemon's default AWS credential chain finds that
+# user's ~/.aws.
+
+[Unit]
+Description=sqsh command agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@NODE_USER@
+Environment=HOME=@NODE_HOME@
+ExecStart=/usr/local/bin/sqshd -config /etc/sqshd/config.yaml
+Restart=on-failure
+RestartSec=5
+# Shutdown waits for one in-flight poll (up to ~30 s) before the drain grace starts.
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

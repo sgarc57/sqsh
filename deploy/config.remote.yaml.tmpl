@@ -1,0 +1,32 @@
+# sqshd configuration for the remote-node test. Rendered by deploy/remote/lib.sh; the
+# @...@ placeholders are filled from the AWS resources and node.env at install time.
+# Derived from deploy/config.example.yaml, with systemctl limited to sshd.service.
+
+host_id: @HOST_ID@
+region: @REGION@
+topic_arn: @TOPIC_ARN@
+queue_url: @QUEUE_URL@
+results_table: sqsh-results
+
+wait_time_seconds: 20
+visibility_timeout: 90s
+max_concurrent_commands: 4
+default_command_timeout: 30s
+max_command_timeout: 60s
+max_clock_skew: 300s
+shutdown_grace: 45s
+max_output_bytes: 32KiB
+result_retention: 336h
+
+allowed_commands: [systemctl]
+
+commands:
+  systemctl:
+    verbs: [status, is-active, is-enabled, show]
+    units: [sshd.service]
+
+# false = dry run: the argv is logged and a succeeded result recorded; nothing is spawned.
+execute: @EXECUTE@
+
+log_level: info
+metrics_addr: 127.0.0.1:9787
